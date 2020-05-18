@@ -1,4 +1,4 @@
-{ stdenv, buildPackages, ghc, lib, gobject-introspection ? null, haskellLib, makeConfigFiles, ghcForComponent, hsPkgs, runCommand, libffi, gmp, zlib, ncurses, nodejs }:
+{ stdenv, buildPackages, ghc, lib, gobject-introspection ? null, haskellLib, makeConfigFiles, ghcForComponent, hsPkgs, runCommand, libgcc, libffi, gmp, zlib, ncurses, nodejs }:
 
 lib.makeOverridable (
 { componentId
@@ -35,6 +35,7 @@ lib.makeOverridable (
 , enableStatic ? component.enableStatic
 , enableShared ? component.enableShared && !haskellLib.isCrossHost
 , enableDeadCodeElimination ? component.enableDeadCodeElimination
+, enableGold ? component.enableGold && !haskellLib.isNativeMusl
 
 # Options for Haddock generation
 , doHaddock ? component.doHaddock  # Enable haddock and hoogle generation
@@ -76,6 +77,19 @@ let
 
   disableFeature = disable: enableFeature (!disable);
 
+  # libgcc_s.a for position independent static executables
+  libgcc_s-static = (let
+    libgcc-fpic = libgcc.overrideAttrs (drv: { preConfigure = drv.preConfigure + "\nexport CFLAGS=-fPIC\n"; });
+    in stdenv.mkDerivation {
+    pname = "libgcc_s-static";
+    inherit (libgcc-fpic) version;
+    installPhase = ''
+      mkdir -p $out/lib
+      cp -L ${libgcc-fpic}/lib/libgcc.a $out/lib/libgcc_s.a
+    '';
+    phases = [ "installPhase" ];
+  });
+
   finalConfigureFlags = lib.concatStringsSep " " (
     [ "--prefix=$out"
       "${haskellLib.componentTarget componentId}"
@@ -89,7 +103,7 @@ let
       [ "--with-gcc=${stdenv.cc.targetPrefix}cc"
       ] ++
       # BINTOOLS
-      (if stdenv.hostPlatform.isLinux
+      (if enableGold && stdenv.hostPlatform.isLinux
         # use gold as the linker on linux to improve link times
         then [
           "--with-ld=${stdenv.cc.bintools.targetPrefix}ld.gold"
@@ -116,10 +130,21 @@ let
       # component.
       "--disable-executable-dynamic"
       "--ghc-option=-optl=-pthread"
-      "--ghc-option=-optl=-static"
+      "--ghc-option=-optl=${if haskellLib.isNativeMusl
+        then "-static-pie" # position independent static exes with DYNAMIC header
+        else "-static"}"   # ordinary static exes
       "--ghc-option=-optl=-L${gmp.override { withStatic = true; }}/lib"
       "--ghc-option=-optl=-L${zlib.static}/lib"
       "--ghc-option=-optl=-L${ncurses.override { enableStatic = true; }}/lib"
+    ] ++ lib.optionals haskellLib.isNativeMusl [
+      # For native musl always generate position independent code...
+      "--ghc-option=-fPIC"
+      "--ghc-option=-fexternal-dynamic-refs"
+    ] ++ lib.optionals (haskellLib.isNativeMusl && (haskellLib.isExecutableType componentId)) [
+      # ... because of static position independent exes
+      "--ghc-option=-optl=-L${libgcc_s-static}/lib"
+      "--ghc-option=-optl-Wl,--no-dynamic-linker" # disable INTERP header
+      "--ghc-option=-optl-Wl,-static" # search only static libs
     ] ++ lib.optional enableSeparateDataOutput "--datadir=$data/share/${ghc.name}"
       ++ lib.optional doHaddock' "--docdir=${docdir "$doc"}"
       ++ lib.optional (enableLibraryProfiling || enableExecutableProfiling) "--profiling-detail=${profilingDetail}"
@@ -338,6 +363,15 @@ stdenv.mkDerivation ({
         '' else ''
            cp -r ${testExecutable} $(dirname $out/bin/${exeName})
         ''}
+      fi
+    '')
+    # symlink static lib with same name and path as a dynamic lib
+    # now ld can find it when linking position independent exes (using path specified with -L flag)
+    + (lib.optionalString (haskellLib.isNativeMusl && (haskellLib.isLibrary componentId || haskellLib.isAll componentId)) ''
+      i=$(${target-pkg-and-db} field ${package.identifier.name} id --simple-output)
+      d=$(${target-pkg-and-db} field ${package.identifier.name} import-dirs --simple-output)
+      if [ ! -z "$d" ]; then # package not empty
+        ln -s $(basename ''${d})/libHS''${i}.a $(dirname ''${d})/libHS''${i}-ghc${ghc.version}.a
       fi
     '')
     # In case `setup copy` did not creat this

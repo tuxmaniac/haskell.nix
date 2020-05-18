@@ -97,9 +97,10 @@ let
     HADDOCK_DOCS = NO
     BUILD_SPHINX_HTML = NO
     BUILD_SPHINX_PDF = NO
-  '' + stdenv.lib.optionalString enableRelocatedStaticLibs ''
-    GhcLibHcOpts += -fPIC
-    GhcRtsHcOpts += -fPIC
+  '' + stdenv.lib.optionalString (enableRelocatedStaticLibs || haskell-nix.haskellLib.isNativeMusl) ''
+    GhcLibHcOpts += -fPIC -fexternal-dynamic-refs
+    GhcRtsHcOpts += -fPIC -fexternal-dynamic-refs
+    GhcRtsCcOpts += -fPIC -DALWAYS_PIC -DDEFAULT_LINKER_ALWAYS_PIC
   '' + stdenv.lib.optionalString targetPlatform.useAndroidPrebuilt ''
     EXTRA_CC_OPTS += -std=gnu99
   '' + stdenv.lib.optionalString useLLVM ''
@@ -157,6 +158,11 @@ in let configured-src = stdenv.mkDerivation (rec {
   postPatch = "patchShebangs .";
 
         src = fetchurl { inherit (src-spec) url sha256; };
+
+        preAutoreconf = stdenv.lib.optionalString haskell-nix.haskellLib.isNativeMusl ''
+            echo "Disabling -no-pie gcc flag check for native musl"
+            sed -i 's@CC -no-pie@CC -nono-pie@g' aclocal.m4
+        '';
 
         # GHC is a bit confused on its cross terminology.
         preConfigure = ''
@@ -224,7 +230,7 @@ in let configured-src = stdenv.mkDerivation (rec {
 
         outputs = [ "out" ];
         phases = [ "unpackPhase" "patchPhase" ]
-              ++ stdenv.lib.optional (ghc-patches != []) "autoreconfPhase"
+              ++ stdenv.lib.optional (ghc-patches != [] || preAutoreconf != "") "autoreconfPhase"
               ++ [ "configurePhase" "installPhase" ];
         installPhase = "cp -r . $out";
     });
@@ -327,6 +333,14 @@ in let configured-src = stdenv.mkDerivation (rec {
         -e '2i export PATH="$PATH:${stdenv.lib.makeBinPath [ targetPackages.stdenv.cc.bintools coreutils ]}"' \
         -e 's/ghcprog="ghc-/ghcprog="${targetPrefix}ghc-/' \
         $i
+    done
+  '' + stdenv.lib.optionalString haskell-nix.haskellLib.isNativeMusl ''
+    for p in $($out/bin/ghc-pkg list --simple-output)
+    do
+      i=$($out/bin/ghc-pkg field $p id --simple-output)
+      [ $i == rts ] && continue
+      d=$($out/bin/ghc-pkg field $p import-dirs --simple-output)
+      ln -s libHS''${i}.a $d/libHS''${i}-ghc${version}.a
     done
   '' + installDeps targetPrefix;
 
