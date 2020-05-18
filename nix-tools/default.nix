@@ -48,6 +48,11 @@ let
             "unix" "xhtml"
           ];
       }
+    ] ++ pkgs.lib.optionals pkgs.stdenv.targetPlatform.isMusl [
+      {
+        packages.nix-tools.configureFlags = [ "--ghc-option=-optl=-L${
+          pkgs.buildPackages.libsodium.overrideAttrs (_: { dontDisableStatic = true; })}/lib" ];
+      }
     ] ++ pkgs.lib.optional (args ? ghc) { ghc.package = args.ghc; };
   };
 
