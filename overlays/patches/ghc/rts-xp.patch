@@ -1,0 +1,649 @@
+From e29b1ee72d77d5a06ac949f9dcc80108243a25c0 Mon Sep 17 00:00:00 2001
+From: Zejun Wu <watashi@fb.com>
+Date: Fri, 28 Dec 2018 20:37:13 -0800
+Subject: [PATCH] Add a RTS option -xp to load PIC object anywhere in address
+ space
+
+Summary:
+This re-applies {D5195} with fixes for i386:
+* Fix unused label warnings, see {D5230} or {D5273}
+* Fix a silly bug introduced by moving `#if`
+
+{P190}
+
+Add a RTS option -xp to load PIC object anywhere in address space. We do
+this by relaxing the requirement of <0x80000000 result of
+`mmapForLinker` and implying USE_CONTIGUOUS_MMAP.
+
+We also need to change calls to `ocInit` and `ocGetNames` to avoid
+dangling pointers when the address of `oc->image` is changed by
+`ocAllocateSymbolExtra`.
+
+Test Plan:
+See {D5195}, also test under i386:
+
+```
+$ uname -a
+Linux watashi-arch32 4.18.5-arch1-1.0-ARCH #1 SMP PREEMPT Tue Aug 28
+20:45:30 CEST 2018 i686 GNU/Linux
+$ cd testsuite/tests/th/ && make test
+...
+```
+
+will run `./validate` on stacked diff.
+
+Reviewers: simonmar, bgamari, alpmestan, trommler, hvr, erikd
+
+Reviewed By: simonmar
+
+Subscribers: rwbarton, carter
+
+Differential Revision: https://phabricator.haskell.org/D5289
+---
+ docs/users_guide/8.8.1-notes.rst     |  4 ++
+ docs/users_guide/runtime_control.rst | 28 +++++++++-
+ includes/rts/Flags.h                 | 12 ++++
+ libraries/base/GHC/RTS/Flags.hsc     |  3 +
+ rts/Linker.c                         | 84 ++++++++++++++--------------
+ rts/RtsFlags.c                       | 11 ++++
+ rts/linker/Elf.c                     | 25 ++-------
+ rts/linker/MachO.c                   | 21 ++++---
+ rts/linker/SymbolExtras.c            | 61 ++++++++++++--------
+ 9 files changed, 155 insertions(+), 94 deletions(-)
+
+diff --git a/docs/users_guide/8.8.1-notes.rst b/docs/users_guide/8.8.1-notes.rst
+index cd4c00d1a4..33b7f48e43 100644
+--- a/docs/users_guide/8.8.1-notes.rst
++++ b/docs/users_guide/8.8.1-notes.rst
+@@ -111,6 +111,10 @@ Runtime system
+   Generation of these files, which sport a ``.hie`` suffix, is enabled via the
+   ``-fwrite-ide-info`` flag. See :ref:`hie-options` for more information.
+ 
++- A new flag ``-xp`` is added on x86_64. When it is passed, the runtime linker
++  can load object files compiled with ``-fPIC -fexternal-dynamic-refs``
++  anywhere in the address space. This used to be restricted to the low 2Gb.
++
+ Template Haskell
+ ~~~~~~~~~~~~~~~~
+ 
+diff --git a/docs/users_guide/runtime_control.rst b/docs/users_guide/runtime_control.rst
+index a5c2f1474f..0048a51837 100644
+--- a/docs/users_guide/runtime_control.rst
++++ b/docs/users_guide/runtime_control.rst
+@@ -241,6 +241,28 @@ Miscellaneous RTS options
+     crashes if exception handling are enabled. In order to get more information
+     in compiled executables, C code or DLLs symbols need to be available.
+ 
++
++.. rts-flag:: -xp
++
++    On 64-bit machines, the runtime linker usually needs to map object code
++    into the low 2Gb of the address space, due to the x86_64 small memory model
++    where most symbol references are 32 bits. The problem is that this 2Gb of
++    address space can fill up, especially if you're loading a very large number
++    of object files into GHCi.
++
++    This flag offers a workaround, albeit a slightly convoluted one. To be able
++    to load an object file outside of the low 2Gb, the object code needs to be
++    compiled with ``-fPIC -fexternal-dynamic-refs``. When the ``+RTS -xp`` flag
++    is passed, the linker will assume that all object files were compiled with
++    ``-fPIC -fexternal-dynamic-refs`` and load them anywhere in the address
++    space. It's up to you to arrange that the object files you load (including
++    all packages) were compiled in the right way. If this is not the case for
++    an object, the linker will probably fail with an error message when the
++    problem is detected.
++
++    On some platforms where PIC is always the case, e.g. x86_64 MacOS X, this
++    flag is enabled by default.
++
+ .. rts-flag:: -xm ⟨address⟩
+ 
+     .. index::
+@@ -250,8 +272,10 @@ Miscellaneous RTS options
+ 
+         This option is for working around memory allocation
+         problems only. Do not use unless GHCi fails with a message like
+-        “\ ``failed to mmap() memory below 2Gb``\ ”. If you need to use this
+-        option to get GHCi working on your machine, please file a bug.
++        “\ ``failed to mmap() memory below 2Gb``\ ”. Consider recompiling
++        the objects with ``-fPIC -fexternal-dynamic-refs`` and using the
++        ``-xp`` flag instead. If you need to use this option to get GHCi
++        working on your machine, please file a bug.
+ 
+     On 64-bit machines, the RTS needs to allocate memory in the low 2Gb
+     of the address space. Support for this across different operating
+diff --git a/includes/rts/Flags.h b/includes/rts/Flags.h
+index 63450d5ece..3582e6abde 100644
+--- a/includes/rts/Flags.h
++++ b/includes/rts/Flags.h
+@@ -188,6 +188,17 @@ typedef struct _CONCURRENT_FLAGS {
+  */
+ #define DEFAULT_TICK_INTERVAL USToTime(10000)
+ 
++/*
++ * When linkerAlwaysPic is true, the runtime linker assume that all object
++ * files were compiled with -fPIC -fexternal-dynamic-refs and load them
++ * anywhere in the address space.
++ */
++#if defined(x86_64_HOST_ARCH) && defined(darwin_HOST_OS)
++#define DEFAULT_LINKER_ALWAYS_PIC true
++#else
++#define DEFAULT_LINKER_ALWAYS_PIC false
++#endif
++
+ /* See Note [Synchronization of flags and base APIs] */
+ typedef struct _MISC_FLAGS {
+     Time    tickInterval;        /* units: TIME_RESOLUTION */
+@@ -197,6 +208,7 @@ typedef struct _MISC_FLAGS {
+     bool generate_stack_trace;
+     bool machineReadable;
+     bool internalCounters;       /* See Note [Internal Counter Stats] */
++    bool linkerAlwaysPic;        /* Assume the object code is always PIC */
+     StgWord linkerMemBase;       /* address to ask the OS for memory
+                                   * for the linker, NULL ==> off */
+ } MISC_FLAGS;
+diff --git a/libraries/base/GHC/RTS/Flags.hsc b/libraries/base/GHC/RTS/Flags.hsc
+index 12cb828e6a..249bcd5a98 100644
+--- a/libraries/base/GHC/RTS/Flags.hsc
++++ b/libraries/base/GHC/RTS/Flags.hsc
+@@ -139,6 +139,7 @@ data MiscFlags = MiscFlags
+     , generateStackTrace    :: Bool
+     , machineReadable       :: Bool
+     , internalCounters      :: Bool
++    , linkerAlwaysPic       :: Bool
+     , linkerMemBase         :: Word
+       -- ^ address to ask the OS for memory for the linker, 0 ==> off
+     } deriving ( Show -- ^ @since 4.8.0.0
+@@ -444,6 +445,8 @@ getMiscFlags = do
+                   (#{peek MISC_FLAGS, machineReadable} ptr :: IO CBool))
+             <*> (toBool <$>
+                   (#{peek MISC_FLAGS, internalCounters} ptr :: IO CBool))
++            <*> (toBool <$>
++                  (#{peek MISC_FLAGS, linkerAlwaysPic} ptr :: IO CBool))
+             <*> #{peek MISC_FLAGS, linkerMemBase} ptr
+ 
+ getDebugFlags :: IO DebugFlags
+diff --git a/rts/Linker.c b/rts/Linker.c
+index ac030af837..296b6441ea 100644
+--- a/rts/Linker.c
++++ b/rts/Linker.c
+@@ -72,10 +72,6 @@
+ #  include <mach-o/fat.h>
+ #endif
+ 
+-#if defined(x86_64_HOST_ARCH) && defined(darwin_HOST_OS)
+-#define ALWAYS_PIC
+-#endif
+-
+ #if defined(dragonfly_HOST_OS)
+ #include <sys/tls.h>
+ #endif
+@@ -212,9 +208,7 @@ int ocTryLoad( ObjectCode* oc );
+  * We pick a default address based on the OS, but also make this
+  * configurable via an RTS flag (+RTS -xm)
+  */
+-#if !defined(ALWAYS_PIC) && defined(x86_64_HOST_ARCH)
+-
+-#if defined(MAP_32BIT)
++#if defined(MAP_32BIT) || DEFAULT_LINKER_ALWAYS_PIC
+ // Try to use MAP_32BIT
+ #define MMAP_32BIT_BASE_DEFAULT 0
+ #else
+@@ -223,7 +217,6 @@ int ocTryLoad( ObjectCode* oc );
+ #endif
+ 
+ static void *mmap_32bit_base = (void *)MMAP_32BIT_BASE_DEFAULT;
+-#endif
+ 
+ static void ghciRemoveSymbolTable(HashTable *table, const SymbolName* key,
+     ObjectCode *owner)
+@@ -496,12 +489,10 @@ initLinker_ (int retain_cafs)
+     }
+ #   endif
+ 
+-#if !defined(ALWAYS_PIC) && defined(x86_64_HOST_ARCH)
+     if (RtsFlags.MiscFlags.linkerMemBase != 0) {
+         // User-override for mmap_32bit_base
+         mmap_32bit_base = (void*)RtsFlags.MiscFlags.linkerMemBase;
+     }
+-#endif
+ 
+     if (RTS_LINKER_USE_MMAP)
+         m32_allocator_init();
+@@ -1009,29 +1000,32 @@ mmapForLinker (size_t bytes, uint32_t flags, int fd, int offset)
+    void *map_addr = NULL;
+    void *result;
+    size_t size;
++   uint32_t tryMap32Bit = RtsFlags.MiscFlags.linkerAlwaysPic
++     ? 0
++     : TRY_MAP_32BIT;
+    static uint32_t fixed = 0;
+ 
+    IF_DEBUG(linker, debugBelch("mmapForLinker: start\n"));
+    size = roundUpToPage(bytes);
+ 
+-#if !defined(ALWAYS_PIC) && defined(x86_64_HOST_ARCH)
++#if defined(x86_64_HOST_ARCH)
+ mmap_again:
++#endif
+ 
+    if (mmap_32bit_base != 0) {
+        map_addr = mmap_32bit_base;
+    }
+-#endif
+ 
+    IF_DEBUG(linker,
+             debugBelch("mmapForLinker: \tprotection %#0x\n",
+                        PROT_EXEC | PROT_READ | PROT_WRITE));
+    IF_DEBUG(linker,
+             debugBelch("mmapForLinker: \tflags      %#0x\n",
+-                       MAP_PRIVATE | TRY_MAP_32BIT | fixed | flags));
++                       MAP_PRIVATE | tryMap32Bit | fixed | flags));
+ 
+    result = mmap(map_addr, size,
+                  PROT_EXEC|PROT_READ|PROT_WRITE,
+-                 MAP_PRIVATE|TRY_MAP_32BIT|fixed|flags, fd, offset);
++                 MAP_PRIVATE|tryMap32Bit|fixed|flags, fd, offset);
+ 
+    if (result == MAP_FAILED) {
+        sysErrorBelch("mmap %" FMT_Word " bytes at %p",(W_)size,map_addr);
+@@ -1039,8 +1033,9 @@ mmap_again:
+        return NULL;
+    }
+ 
+-#if !defined(ALWAYS_PIC) && defined(x86_64_HOST_ARCH)
+-   if (mmap_32bit_base != 0) {
++#if defined(x86_64_HOST_ARCH)
++   if (RtsFlags.MiscFlags.linkerAlwaysPic) {
++   } else if (mmap_32bit_base != 0) {
+        if (result == map_addr) {
+            mmap_32bit_base = (StgWord8*)map_addr + size;
+        } else {
+@@ -1208,10 +1203,10 @@ void freeObjectCode (ObjectCode *oc)
+ #if defined(NEED_SYMBOL_EXTRAS) && (!defined(x86_64_HOST_ARCH) \
+                                     || !defined(mingw32_HOST_OS))
+     if (RTS_LINKER_USE_MMAP) {
+-        if (!USE_CONTIGUOUS_MMAP && oc->symbol_extras != NULL) {
+-            m32_free(oc->symbol_extras,
+-                    sizeof(SymbolExtra) * oc->n_symbol_extras);
+-        }
++      if (!USE_CONTIGUOUS_MMAP && !RtsFlags.MiscFlags.linkerAlwaysPic &&
++          oc->symbol_extras != NULL) {
++        m32_free(oc->symbol_extras, sizeof(SymbolExtra) * oc->n_symbol_extras);
++      }
+     }
+     else {
+         stgFree(oc->symbol_extras);
+@@ -1504,32 +1499,21 @@ HsInt loadOc (ObjectCode* oc)
+    }
+ 
+    /* Note [loadOc orderings]
+-      ocAllocateSymbolsExtras has only two pre-requisites, it must run after
+-      preloadObjectFile and ocVerify.   Neither have changed.   On most targets
+-      allocating the extras is independent on parsing the section data, so the
+-      order between these two never mattered.
++      The order of `ocAllocateSymbolExtras` and `ocGetNames` matters. For MachO
++      and ELF, `ocInit` and `ocGetNames` initialize a bunch of pointers based
++      on the offset to `oc->image`, but `ocAllocateSymbolExtras` may relocate
++      the address of `oc->image` and invalidate those pointers. So we must
++      compute or recompute those pointers after `ocAllocateSymbolExtras`.
+ 
+       On Windows, when we have an import library we (for now, as we don't honor
+       the lazy loading semantics of the library and instead GHCi is already
+       lazy) don't use the library after ocGetNames as it just populates the
+       symbol table.  Allocating space for jump tables in ocAllocateSymbolExtras
+       would just be a waste then as we'll be stopping further processing of the
+-      library in the next few steps.  */
+-
+-   /* build the symbol list for this image */
+-#  if defined(OBJFORMAT_ELF)
+-   r = ocGetNames_ELF ( oc );
+-#  elif defined(OBJFORMAT_PEi386)
+-   r = ocGetNames_PEi386 ( oc );
+-#  elif defined(OBJFORMAT_MACHO)
+-   r = ocGetNames_MachO ( oc );
+-#  else
+-   barf("loadObj: no getNames method");
+-#  endif
+-   if (!r) {
+-       IF_DEBUG(linker, debugBelch("loadOc: ocGetNames_* failed\n"));
+-       return r;
+-   }
++      library in the next few steps. If necessary, the actual allocation
++      happens in `ocGetNames_PEi386` and `ocAllocateSymbolExtras_PEi386` simply
++      set the correct pointers.
++      */
+ 
+ #if defined(NEED_SYMBOL_EXTRAS)
+ #  if defined(OBJFORMAT_MACHO)
+@@ -1546,7 +1530,26 @@ HsInt loadOc (ObjectCode* oc)
+                 debugBelch("loadOc: ocAllocateSymbolExtras_ELF failed\n"));
+        return r;
+    }
++#  endif
++#endif
++
++   /* build the symbol list for this image */
++#  if defined(OBJFORMAT_ELF)
++   r = ocGetNames_ELF ( oc );
+ #  elif defined(OBJFORMAT_PEi386)
++   r = ocGetNames_PEi386 ( oc );
++#  elif defined(OBJFORMAT_MACHO)
++   r = ocGetNames_MachO ( oc );
++#  else
++   barf("loadObj: no getNames method");
++#  endif
++   if (!r) {
++       IF_DEBUG(linker, debugBelch("loadOc: ocGetNames_* failed\n"));
++       return r;
++   }
++
++#if defined(NEED_SYMBOL_EXTRAS)
++#  if defined(OBJFORMAT_PEi386)
+    ocAllocateSymbolExtras_PEi386 ( oc );
+ #  endif
+ #endif
+@@ -1833,4 +1836,3 @@ addSection (Section *s, SectionKind kind, SectionAlloc alloc,
+                        start, (void*)((StgWord)start + size),
+                        size, kind ));
+ }
+-
+diff --git a/rts/RtsFlags.c b/rts/RtsFlags.c
+index ff9635ab24..37eafa5c55 100644
+--- a/rts/RtsFlags.c
++++ b/rts/RtsFlags.c
+@@ -236,6 +236,7 @@ void initRtsFlagsDefaults(void)
+     RtsFlags.MiscFlags.generate_dump_file      = false;
+     RtsFlags.MiscFlags.machineReadable         = false;
+     RtsFlags.MiscFlags.internalCounters        = false;
++    RtsFlags.MiscFlags.linkerAlwaysPic         = DEFAULT_LINKER_ALWAYS_PIC;
+     RtsFlags.MiscFlags.linkerMemBase           = 0;
+ 
+ #if defined(THREADED_RTS)
+@@ -457,6 +458,11 @@ usage_text[] = {
+ "  -e<n>     Maximum number of outstanding local sparks (default: 4096)",
+ #endif
+ #if defined(x86_64_HOST_ARCH)
++#if !DEFAULT_LINKER_ALWAYS_PIC
++"  -xp       Assume that all object files were compiled with -fPIC",
++"            -fexternal-dynamic-refs and load them anywhere in the address",
++"            space",
++#endif
+ "  -xm       Base address to mmap memory in the GHCi linker",
+ "            (hex; must be <80000000)",
+ #endif
+@@ -1502,6 +1508,11 @@ error = true;
+                     break;
+ 
+ #if defined(x86_64_HOST_ARCH)
++                case 'p': /* linkerAlwaysPic */
++                    OPTION_UNSAFE;
++                    RtsFlags.MiscFlags.linkerAlwaysPic = true;
++                    break;
++
+                 case 'm': /* linkerMemBase */
+                     OPTION_UNSAFE;
+                     if (rts_argv[arg][3] != '\0') {
+diff --git a/rts/linker/Elf.c b/rts/linker/Elf.c
+index 9ea10d443f..ae85d73170 100644
+--- a/rts/linker/Elf.c
++++ b/rts/linker/Elf.c
+@@ -169,6 +169,8 @@ get_shndx_table(Elf_Ehdr* ehdr)
+ void
+ ocInit_ELF(ObjectCode * oc)
+ {
++    ocDeinit_ELF(oc);
++
+     oc->info = (struct ObjectCodeFormatInfo*)stgCallocBytes(
+             1, sizeof *oc->info,
+             "ocInit_Elf(ObjectCodeFormatInfo)");
+@@ -318,6 +320,7 @@ ocDeinit_ELF(ObjectCode * oc)
+         }
+ 
+         stgFree(oc->info);
++        oc->info = NULL;
+     }
+ }
+ 
+@@ -754,7 +757,7 @@ ocGetNames_ELF ( ObjectCode* oc )
+           start = mem;
+           mapped_start = mem;
+ #else
+-          if (USE_CONTIGUOUS_MMAP) {
++          if (USE_CONTIGUOUS_MMAP || RtsFlags.MiscFlags.linkerAlwaysPic) {
+               // already mapped.
+               start = oc->image + offset;
+               alloc = SECTION_NOMEM;
+@@ -1585,9 +1588,6 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
+ 
+       case COMPAT_R_X86_64_PC32:
+       {
+-#if defined(ALWAYS_PIC)
+-          barf("R_X86_64_PC32 relocation, but ALWAYS_PIC.");
+-#else
+           StgInt64 off = value - P;
+           if (off != (Elf64_Sword)off && X86_64_ELF_NONPIC_HACK) {
+               StgInt64 pltAddress =
+@@ -1604,7 +1604,6 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
+           }
+           Elf64_Sword payload = off;
+           memcpy((void*)P, &payload, sizeof(payload));
+-#endif
+           break;
+       }
+ 
+@@ -1617,9 +1616,6 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
+ 
+       case COMPAT_R_X86_64_32:
+       {
+-#if defined(ALWAYS_PIC)
+-          barf("R_X86_64_32 relocation, but ALWAYS_PIC.");
+-#else
+           if (value != (Elf64_Word)value && X86_64_ELF_NONPIC_HACK) {
+               StgInt64 pltAddress =
+                   (StgInt64) &makeSymbolExtra(oc, ELF_R_SYM(info), S)
+@@ -1635,15 +1631,11 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
+           }
+           Elf64_Word payload = value;
+           memcpy((void*)P, &payload, sizeof(payload));
+-#endif
+           break;
+       }
+ 
+       case COMPAT_R_X86_64_32S:
+       {
+-#if defined(ALWAYS_PIC)
+-          barf("R_X86_64_32S relocation, but ALWAYS_PIC.");
+-#else
+           if ((StgInt64)value != (Elf64_Sword)value && X86_64_ELF_NONPIC_HACK) {
+               StgInt64 pltAddress =
+                   (StgInt64) &makeSymbolExtra(oc, ELF_R_SYM(info), S)
+@@ -1659,7 +1651,6 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
+           }
+           Elf64_Sword payload = value;
+           memcpy((void*)P, &payload, sizeof(payload));
+-#endif
+           break;
+       }
+       case COMPAT_R_X86_64_REX_GOTPCRELX:
+@@ -1681,9 +1672,6 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
+ #if defined(dragonfly_HOST_OS)
+       case COMPAT_R_X86_64_GOTTPOFF:
+       {
+-#if defined(ALWAYS_PIC)
+-          barf("R_X86_64_GOTTPOFF relocation, but ALWAYS_PIC.");
+-#else
+         /* determine the offset of S to the current thread's tls
+            area
+            XXX: Move this to the beginning of function */
+@@ -1701,16 +1689,12 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
+           }
+           Elf64_SWord payload = off;
+           memcpy((void*)P, &payload, sizeof(payload));
+-#endif
+           break;
+       }
+ #endif
+ 
+       case COMPAT_R_X86_64_PLT32:
+       {
+-#if defined(ALWAYS_PIC)
+-          barf("R_X86_64_PLT32 relocation, but ALWAYS_PIC.");
+-#else
+           StgInt64 off = value - P;
+           if (off != (Elf64_Sword)off) {
+               StgInt64 pltAddress = (StgInt64) &makeSymbolExtra(oc, ELF_R_SYM(info), S)
+@@ -1725,7 +1709,6 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
+           }
+           Elf64_Sword payload = off;
+           memcpy((void*)P, &payload, sizeof(payload));
+-#endif
+           break;
+       }
+ #endif
+diff --git a/rts/linker/MachO.c b/rts/linker/MachO.c
+index c6a6c28440..4a1204dde9 100644
+--- a/rts/linker/MachO.c
++++ b/rts/linker/MachO.c
+@@ -99,6 +99,8 @@ bool ocMprotect_MachO( ObjectCode *oc );
+ void
+ ocInit_MachO(ObjectCode * oc)
+ {
++    ocDeinit_MachO(oc);
++
+     oc->info = (struct ObjectCodeFormatInfo*)stgCallocBytes(
+                 1, sizeof *oc->info,
+                 "ocInit_MachO(ObjectCodeFormatInfo)");
+@@ -160,16 +162,19 @@ ocInit_MachO(ObjectCode * oc)
+ 
+ void
+ ocDeinit_MachO(ObjectCode * oc) {
+-    if(oc->info->n_macho_symbols > 0) {
+-        stgFree(oc->info->macho_symbols);
+-    }
++    if (oc->info != NULL) {
++        if(oc->info->n_macho_symbols > 0) {
++            stgFree(oc->info->macho_symbols);
++        }
+ #if defined(aarch64_HOST_ARCH)
+-    freeGot(oc);
+-    for(int i = 0; i < oc->n_sections; i++) {
+-        freeStubs(&oc->sections[i]);
+-    }
++        freeGot(oc);
++        for(int i = 0; i < oc->n_sections; i++) {
++            freeStubs(&oc->sections[i]);
++        }
+ #endif
+-    stgFree(oc->info);
++        stgFree(oc->info);
++        oc->info = NULL;
++    }
+ }
+ 
+ static int
+diff --git a/rts/linker/SymbolExtras.c b/rts/linker/SymbolExtras.c
+index 88541f44d0..4c40b10877 100644
+--- a/rts/linker/SymbolExtras.c
++++ b/rts/linker/SymbolExtras.c
+@@ -19,6 +19,12 @@
+ #include "linker/SymbolExtras.h"
+ #include "linker/M32Alloc.h"
+ 
++#if defined(OBJFORMAT_ELF)
++#  include "linker/Elf.h"
++#elif defined(OBJFORMAT_MACHO)
++#  include "linker/MachO.h"
++#endif
++
+ #include <string.h>
+ #if RTS_LINKER_USE_MMAP
+ #include <sys/mman.h>
+@@ -46,8 +52,24 @@
+ int ocAllocateSymbolExtras( ObjectCode* oc, int count, int first )
+ {
+   size_t n;
++  void* oldImage = oc->image;
++
++  if (count > 0) {
++    if (!RTS_LINKER_USE_MMAP) {
++
++      // round up to the nearest 4
++      int aligned = (oc->fileSize + 3) & ~3;
++      int misalignment = oc->misalignment;
+ 
+-  if (RTS_LINKER_USE_MMAP && USE_CONTIGUOUS_MMAP) {
++      oc->image -= misalignment;
++      oc->image = stgReallocBytes( oc->image,
++                               misalignment +
++                               aligned + sizeof (SymbolExtra) * count,
++                               "ocAllocateSymbolExtras" );
++      oc->image += misalignment;
++
++      oc->symbol_extras = (SymbolExtra *) (oc->image + aligned);
++    } else if (USE_CONTIGUOUS_MMAP || RtsFlags.MiscFlags.linkerAlwaysPic) {
+       n = roundUpToPage(oc->fileSize);
+ 
+       /* Keep image and symbol_extras contiguous */
+@@ -63,42 +85,37 @@ int ocAllocateSymbolExtras( ObjectCode* oc, int count, int first )
+           oc->imageMapped = true;
+           oc->fileSize = n + (sizeof(SymbolExtra) * count);
+           oc->symbol_extras = (SymbolExtra *) (oc->image + n);
+-          if(mprotect(new, allocated_size, PROT_READ | PROT_EXEC) != 0) {
+-              sysErrorBelch("unable to protect memory");
++          if (mprotect(new, allocated_size,
++                       PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
++            sysErrorBelch("unable to protect memory");
+           }
+       }
+       else {
+           oc->symbol_extras = NULL;
+           return 0;
+       }
+-  }
+-  else if( count > 0 ) {
+-    if (RTS_LINKER_USE_MMAP) {
+-        n = roundUpToPage(oc->fileSize);
+-
++    } else {
+         oc->symbol_extras = m32_alloc(sizeof(SymbolExtra) * count, 8);
+         if (oc->symbol_extras == NULL) return 0;
+     }
+-    else {
+-        // round up to the nearest 4
+-        int aligned = (oc->fileSize + 3) & ~3;
+-        int misalignment = oc->misalignment;
+-
+-        oc->image -= misalignment;
+-        oc->image = stgReallocBytes( oc->image,
+-                                 misalignment +
+-                                 aligned + sizeof (SymbolExtra) * count,
+-                                 "ocAllocateSymbolExtras" );
+-        oc->image += misalignment;
+-
+-        oc->symbol_extras = (SymbolExtra *) (oc->image + aligned);
+-    }
+   }
+ 
+   if (oc->symbol_extras != NULL) {
+       memset( oc->symbol_extras, 0, sizeof (SymbolExtra) * count );
+   }
+ 
++  // ObjectCodeFormatInfo contains computed addresses based on offset to
++  // image, if the address of image changes, we need to invalidate
++  // the ObjectCodeFormatInfo and recompute it.
++  if (oc->image != oldImage) {
++#if defined(OBJFORMAT_MACHO)
++    ocInit_MachO( oc );
++#endif
++#if defined(OBJFORMAT_ELF)
++    ocInit_ELF( oc );
++#endif
++  }
++
+   oc->first_symbol_extra = first;
+   oc->n_symbol_extras = count;
+ 
+-- 
+2.25.3
+
