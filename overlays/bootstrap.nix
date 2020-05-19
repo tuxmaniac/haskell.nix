@@ -113,6 +113,7 @@ in {
                 ++ final.lib.optional (version == "8.6.4") ./patches/ghc/ghc-8.6.4-better-plusSimplCountErrors.patch
                 ++ final.lib.optional (versionAtLeast "8.6.4" && final.stdenv.isDarwin) ./patches/ghc/ghc-macOS-loadArchive-fix.patch
                 ++ final.lib.optional (versionAtLeast "8.4.4" && final.stdenv.isDarwin) ./patches/ghc/ghc-darwin-gcc-version-fix.patch
+                ++ fromUntil "8.8"    "8.10"  ./patches/ghc/rts-xp.patch
                 ;
         in ({
             ghc844 = final.callPackage ../compiler/ghc {
