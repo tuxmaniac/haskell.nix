@@ -100,7 +100,7 @@ let
   '' + stdenv.lib.optionalString (enableRelocatedStaticLibs || haskell-nix.haskellLib.isNativeMusl) ''
     GhcLibHcOpts += -fPIC -fexternal-dynamic-refs
     GhcRtsHcOpts += -fPIC -fexternal-dynamic-refs
-    GhcRtsCcOpts += -fPIC -DALWAYS_PIC -DDEFAULT_LINKER_ALWAYS_PIC
+    GhcRtsCcOpts += -fPIC
   '' + stdenv.lib.optionalString targetPlatform.useAndroidPrebuilt ''
     EXTRA_CC_OPTS += -std=gnu99
   '' + stdenv.lib.optionalString useLLVM ''
@@ -340,7 +340,13 @@ in let configured-src = stdenv.mkDerivation (rec {
       i=$($out/bin/ghc-pkg field $p id --simple-output)
       [ $i == rts ] && continue
       d=$($out/bin/ghc-pkg field $p import-dirs --simple-output)
-      ln -s libHS''${i}.a $d/libHS''${i}-ghc${version}.a
+      l=$d/libHS''${i}-ghc${version}.a
+      if [ $i == ghc-${version} ]; then
+        ln -sv libHS''${i}.a $l
+      else
+        ar r $l $d/HS$i.o
+        ranlib $l
+      fi
     done
   '' + installDeps targetPrefix;
 
