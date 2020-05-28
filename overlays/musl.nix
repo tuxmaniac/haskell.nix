@@ -20,6 +20,7 @@ final: prev: prev.lib.optionalAttrs prev.stdenv.hostPlatform.isMusl ({
   # and a few more packages that need their static libs explicitly enabled
   gmp = prev.gmp.override { withStatic = true; };
   ncurses = prev.ncurses.override { enableStatic = true; };
+  libsodium = prev.libsodium.overrideAttrs (_: { dontDisableStatic = true; });
 
   # Fails on cross compile
   nix = prev.nix.overrideAttrs (_: { doInstallCheck = false; });
