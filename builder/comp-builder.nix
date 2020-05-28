@@ -1,10 +1,11 @@
 { stdenv, buildPackages, ghc, lib, gobject-introspection ? null, haskellLib, makeConfigFiles, ghcForComponent, hsPkgs, runCommand, libgcc, libffi, gmp, zlib, ncurses, nodejs }:
 
 lib.makeOverridable (
+let self =
 { componentId
 , component
 , package
-, name
+, name # This is the package name
 , setup
 , src
 , flags
@@ -33,7 +34,10 @@ lib.makeOverridable (
 , dontStrip ? component.dontStrip
 
 , enableStatic ? component.enableStatic
-, enableShared ? component.enableShared && !haskellLib.isCrossHost
+, enableShared ? ghc.enableShared && component.enableShared && !haskellLib.isCrossHost
+               # on x86 we'll use shared libraries, even with musl m(
+               # ghc's internal linker seems to be broken on x86.
+               && !(stdenv.hostPlatform.isMusl && !stdenv.hostPlatform.isx86)
 , enableDeadCodeElimination ? component.enableDeadCodeElimination
 , enableGold ? component.enableGold && !haskellLib.isNativeMusl
 
@@ -52,9 +56,16 @@ lib.makeOverridable (
 # Data
 , enableSeparateDataOutput ? component.enableSeparateDataOutput
 
+# Prelinked ghci libraries; will make iserv faster; especially for static builds.
+, enableLibraryForGhci ? true
+
 # Debug
 , enableDebugRTS ? false
-}:
+, enableDWARF ? false
+
+# LLVM
+, useLLVM ? ghc.useLLVM
+}@drvArgs:
 
 let
   # TODO fix cabal wildcard support so hpack wildcards can be mapped to cabal wildcards
@@ -62,9 +73,11 @@ let
     then builtins.trace ("Cleaning component source not supported for hpack package: " + name) src
     else haskellLib.cleanCabalComponent package component src;
 
-  fullName = if haskellLib.isAll componentId
-    then "${name}-all"
-    else "${name}-${componentId.ctype}-${componentId.cname}";
+  nameOnly = if haskellLib.isAll componentId
+    then "${package.identifier.name}-all"
+    else "${package.identifier.name}-${componentId.ctype}-${componentId.cname}";
+
+  fullName = "${nameOnly}-${package.identifier.version}";
 
   configFiles = makeConfigFiles {
     inherit (package) identifier;
@@ -123,6 +136,7 @@ let
       (enableFeature enableExecutableProfiling "executable-profiling")
       (enableFeature enableStatic "static")
       (enableFeature enableShared "shared")
+      (enableFeature enableLibraryForGhci "library-for-ghci")
     ] ++ lib.optionals (stdenv.hostPlatform.isMusl && (haskellLib.isExecutableType componentId)) [
       # These flags will make sure the resulting executable is statically linked.
       # If it uses other libraries it may be necessary for to add more
@@ -133,9 +147,6 @@ let
       "--ghc-option=-optl=${if haskellLib.isNativeMusl
         then "-static-pie" # position independent static exes with DYNAMIC header
         else "-static"}"   # ordinary static exes
-      "--ghc-option=-optl=-L${gmp.override { withStatic = true; }}/lib"
-      "--ghc-option=-optl=-L${zlib.static}/lib"
-      "--ghc-option=-optl=-L${ncurses.override { enableStatic = true; }}/lib"
     ] ++ lib.optionals haskellLib.isNativeMusl [
       # For native musl always generate position independent code...
       "--ghc-option=-fPIC"
@@ -155,6 +166,10 @@ let
       ++ configureFlags
       ++ (ghc.extraConfigureFlags or [])
       ++ lib.optional enableDebugRTS "--ghc-option=-debug"
+      ++ lib.optional enableDWARF "--ghc-option=-g"
+      ++ lib.optionals useLLVM [
+        "--ghc-option=-fPIC" "--gcc-option=-fPIC"
+        ]
     );
 
   setupGhcOptions = lib.optional (package.ghcOptions != null) '' --ghc-options="${package.ghcOptions}"'';
@@ -192,7 +207,8 @@ let
 in stdenv.lib.fix (drv:
 
 stdenv.mkDerivation ({
-  name = "${ghc.targetPrefix}${fullName}";
+  pname = nameOnly;
+  inherit (package.identifier) version;
 
   src = cleanSrc;
 
@@ -210,6 +226,7 @@ stdenv.mkDerivation ({
     # The directory containing the haddock documentation.
     # `null' if no haddock documentation was built.
     haddockDir = if doHaddock' then "${docdir drv.doc}/html" else null;
+    profiled = self (drvArgs // { enableLibraryProfiling = true; });
   };
 
   meta = {
@@ -410,4 +427,4 @@ stdenv.mkDerivation ({
     preInstall postInstall preHaddock postHaddock;
 }
 // lib.optionalAttrs (stdenv.buildPlatform.libc == "glibc"){ LOCALE_ARCHIVE = "${buildPackages.glibcLocales}/lib/locale/locale-archive"; }
-)))
+)); in self)
